@@ -1,0 +1,811 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ジャンプ！タイミングゲーム</title>
+  <style>
+    /* ===========================
+       グローバルスタイル
+    =========================== */
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      background: linear-gradient(135deg, #a18cd1 0%, #fbc2eb 100%);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      overflow: hidden;
+      font-family: 'Segoe UI', 'Arial Rounded MT Bold', Arial, sans-serif;
+    }
+
+    /* キャンバスのラッパー */
+    #wrapper {
+      position: relative;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+
+    /* ゲームキャンバス本体 */
+    canvas {
+      display: block;
+      border-radius: 20px;
+      box-shadow: 0 24px 64px rgba(0, 0, 0, 0.35);
+      /* タッチ時の長押しメニューを無効化 */
+      -webkit-touch-callout: none;
+      user-select: none;
+    }
+  </style>
+</head>
+<body>
+<div id="wrapper">
+  <canvas id="gameCanvas"></canvas>
+</div>
+
+<script>
+/* =====================================================
+   🎮 ゲームパラメータ ─ ここで値を調整できます
+   ===================================================== */
+const CFG = {
+  /* ── キャンバス ── */
+  W: 800,             // キャンバス幅 (px)
+  H: 420,             // キャンバス高さ (px)
+
+  /* ── プレイヤー ── */
+  PLAYER_X: 110,      // プレイヤーの固定X座標
+  PLAYER_SIZE: 52,    // プレイヤーの描画サイズ
+  JUMP_FORCE: -15,    // ジャンプ初速（マイナスが上方向）
+  GRAVITY: 0.65,      // 重力加速度（大きいほど重くなる）
+  MAX_FALL: 16,       // 最大落下速度
+
+  /* ── 地面 ── */
+  GROUND_H: 72,       // 地面の高さ
+
+  /* ── 障害物 ── */
+  OBS_W: 52,          // 障害物の幅
+  OBS_MIN_H: 45,      // 障害物の最小高さ
+  OBS_MAX_H: 130,     // 障害物の最大高さ
+  OBS_MIN_GAP: 220,   // 障害物の最小間隔 (px)
+  OBS_MAX_GAP: 380,   // 障害物の最大間隔 (px)
+  FIRST_OBS: 320,     // 最初の障害物が出るまでの距離
+
+  /* ── 速度 ── */
+  SPEED_INIT: 4.2,    // 初期スクロール速度
+  SPEED_MAX: 13,      // 最大スクロール速度
+  SPEED_INC: 0.0012,  // フレームごとの速度増加量
+
+  /* ── スコア ── */
+  SCORE_RATE: 0.12,   // フレームごとのスコア加算量
+
+  /* ── パーティクル ── */
+  JUMP_PTCL: 12,      // ジャンプ時のパーティクル数
+  DIE_PTCL: 35,       // ゲームオーバー時のパーティクル数
+
+  /* ── カラーパレット（ポップ！） ── */
+  SKY_TOP:    '#c9f0ff', // 空グラデーション上
+  SKY_BTM:    '#fff6e6', // 空グラデーション下
+  GROUND_TOP: '#6dcc52', // 地面上部（芝生）
+  GROUND_BOT: '#4a9a30', // 地面下部
+  GROUND_LINE:'#3a7a22', // 地面境界線
+  CLOUD_CLR:  'rgba(255,255,255,0.85)', // 雲の色
+
+  /* 障害物カラーリスト */
+  OBS_COLORS: ['#ff6b6b','#ff9f43','#a29bfe','#00cec9','#fd79a8','#6c5ce7'],
+};
+
+/* =====================================================
+   キャンバスのセットアップ・レスポンシブ対応
+   ===================================================== */
+const canvas = document.getElementById('gameCanvas');
+const ctx    = canvas.getContext('2d');
+canvas.width  = CFG.W;
+canvas.height = CFG.H;
+
+function resizeCanvas() {
+  const maxW = Math.min(window.innerWidth - 16, CFG.W);
+  const scale = maxW / CFG.W;
+  canvas.style.width  = `${CFG.W * scale}px`;
+  canvas.style.height = `${CFG.H * scale}px`;
+}
+resizeCanvas();
+window.addEventListener('resize', resizeCanvas);
+
+/* =====================================================
+   ゲーム状態
+   ===================================================== */
+const STATE = { TITLE: 0, PLAYING: 1, OVER: 2 };
+let state      = STATE.TITLE;
+let score      = 0;
+let best       = parseInt(localStorage.getItem('jtg_best') || '0');
+let speed      = CFG.SPEED_INIT;
+let frame      = 0;         // フレームカウンター（アニメーション用）
+let bgOfs      = 0;         // 地面スクロールオフセット
+let nextObsDist = CFG.FIRST_OBS; // 次の障害物までの距離カウンター
+
+/* =====================================================
+   プレイヤーオブジェクト
+   ===================================================== */
+const player = {
+  x: CFG.PLAYER_X,
+  y: 0,
+  w: CFG.PLAYER_SIZE,
+  h: CFG.PLAYER_SIZE,
+  vy: 0,
+  onGround: true,
+
+  /* 地面Y座標 */
+  get groundY() {
+    return CFG.H - CFG.GROUND_H - this.h;
+  },
+
+  reset() {
+    this.y = this.groundY;
+    this.vy = 0;
+    this.onGround = true;
+  },
+
+  jump() {
+    if (!this.onGround) return;
+    this.vy = CFG.JUMP_FORCE;
+    this.onGround = false;
+    spawnJumpParticles(this.x + this.w / 2, this.y + this.h);
+  },
+
+  update() {
+    this.vy = Math.min(this.vy + CFG.GRAVITY, CFG.MAX_FALL);
+    this.y += this.vy;
+    if (this.y >= this.groundY) {
+      this.y = this.groundY;
+      this.vy = 0;
+      this.onGround = true;
+    }
+  },
+
+  /* 当たり判定用ヒットボックス（見た目より少し小さめ） */
+  hitbox() {
+    const m = 10;
+    return { x: this.x + m, y: this.y + m, w: this.w - m*2, h: this.h - m*2 };
+  },
+
+  draw() {
+    ctx.save();
+
+    /* ジャンプ中は少し回転してポップな動きを演出 */
+    const rot = this.onGround ? 0 : Math.sin(frame * 0.18) * 0.22;
+
+    /* 着地影 */
+    const shadowAlpha = this.onGround ? 0.25 : Math.max(0, 0.18 - (this.groundY - this.y) * 0.001);
+    const shadowScale = this.onGround ? 1 : Math.max(0.4, 1 - (this.groundY - this.y) * 0.006);
+    ctx.save();
+    ctx.globalAlpha = shadowAlpha;
+    ctx.fillStyle = '#000';
+    ctx.scale(1, 0.3);
+    ctx.beginPath();
+    ctx.ellipse(
+      this.x + this.w / 2,
+      (this.groundY + this.h) / 0.3 + 4,
+      (this.w / 2.2) * shadowScale,
+      6,
+      0, 0, Math.PI * 2
+    );
+    ctx.fill();
+    ctx.restore();
+
+    /* プレイヤー絵文字 */
+    ctx.translate(this.x + this.w / 2, this.y + this.h / 2);
+    ctx.rotate(rot);
+    ctx.font = `${CFG.PLAYER_SIZE}px serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('🐥', 0, 0);
+
+    ctx.restore();
+  },
+};
+
+/* =====================================================
+   障害物管理
+   ===================================================== */
+let obstacles = [];
+
+function spawnObstacle() {
+  /* 高い障害物を20%の確率で生成 */
+  const tall = Math.random() < 0.2;
+  const h = tall
+    ? CFG.OBS_MAX_H * 1.6
+    : CFG.OBS_MIN_H + Math.random() * (CFG.OBS_MAX_H - CFG.OBS_MIN_H);
+
+  obstacles.push({
+    x:      CFG.W + 60,
+    y:      CFG.H - CFG.GROUND_H - h,
+    w:      CFG.OBS_W,
+    h,
+    passed: false,
+    color:  CFG.OBS_COLORS[Math.floor(Math.random() * CFG.OBS_COLORS.length)],
+    emoji:  tall ? '🌵' : (Math.random() < 0.5 ? '📦' : '🪨'),
+    phase:  Math.random() * Math.PI * 2, // 揺れ位相
+  });
+}
+
+function updateObstacles() {
+  for (let i = obstacles.length - 1; i >= 0; i--) {
+    const o = obstacles[i];
+    o.x -= speed;
+    o.phase += 0.06;
+
+    /* 画面外に出たら削除 */
+    if (o.x + o.w < 0) { obstacles.splice(i, 1); continue; }
+
+    /* プレイヤーを通過したらスコア加算 */
+    if (!o.passed && o.x + o.w < player.x) {
+      o.passed = true;
+      spawnScorePopup(player.x + player.w + 5, player.y - 5);
+    }
+  }
+
+  /* 新しい障害物の出現タイミング */
+  nextObsDist -= speed;
+  if (nextObsDist <= 0) {
+    spawnObstacle();
+    /* 速度が上がるほど間隔が縮まる */
+    const ratio = (speed - CFG.SPEED_INIT) / (CFG.SPEED_MAX - CFG.SPEED_INIT);
+    const gap = CFG.OBS_MIN_GAP + (CFG.OBS_MAX_GAP - CFG.OBS_MIN_GAP) * (1 - ratio * 0.5);
+    nextObsDist = gap + Math.random() * 60;
+  }
+}
+
+function drawObstacles() {
+  obstacles.forEach(o => {
+    ctx.save();
+
+    /* 軽い揺れ（ポップ感） */
+    const wobble = Math.sin(o.phase) * 2;
+
+    /* 影 */
+    ctx.globalAlpha = 0.18;
+    ctx.fillStyle = '#000';
+    fillRoundRect(o.x + 5, o.y + 8 + wobble, o.w, o.h, 10);
+    ctx.globalAlpha = 1;
+
+    /* 本体 */
+    ctx.fillStyle = o.color;
+    fillRoundRect(o.x, o.y + wobble, o.w, o.h, 10);
+
+    /* ハイライト */
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    fillRoundRect(o.x + 5, o.y + 5 + wobble, o.w - 10, o.h * 0.28, 7);
+
+    /* 絵文字アイコン */
+    ctx.font = '28px serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(o.emoji, o.x + o.w / 2, o.y + o.h / 2 + wobble);
+
+    ctx.restore();
+  });
+}
+
+/* =====================================================
+   衝突判定（AABB）
+   ===================================================== */
+function checkCollision() {
+  const p = player.hitbox();
+  for (const o of obstacles) {
+    if (
+      p.x < o.x + o.w && p.x + p.w > o.x &&
+      p.y < o.y + o.h && p.y + p.h > o.y
+    ) return true;
+  }
+  return false;
+}
+
+/* =====================================================
+   パーティクルシステム
+   ===================================================== */
+let particles  = [];
+let scorePopups = [];
+
+/* ジャンプ時の地面パーティクル */
+function spawnJumpParticles(x, y) {
+  for (let i = 0; i < CFG.JUMP_PTCL; i++) {
+    particles.push({
+      x, y,
+      vx: (Math.random() - 0.5) * 5,
+      vy: -Math.random() * 3.5 - 0.5,
+      r:  Math.random() * 7 + 3,
+      color: `hsl(${Math.random() * 50 + 30},100%,65%)`,
+      life: 1,
+    });
+  }
+}
+
+/* ゲームオーバー時の爆発パーティクル */
+function spawnDeathParticles(x, y) {
+  for (let i = 0; i < CFG.DIE_PTCL; i++) {
+    const angle = (Math.PI * 2 / CFG.DIE_PTCL) * i + Math.random() * 0.5;
+    const spd   = Math.random() * 6 + 2;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * spd,
+      vy: Math.sin(angle) * spd - 3,
+      r:  Math.random() * 10 + 4,
+      color: `hsl(${Math.random() * 360},100%,60%)`,
+      life: 1,
+    });
+  }
+}
+
+/* スコアポップアップ（+1 が浮かぶ） */
+function spawnScorePopup(x, y) {
+  scorePopups.push({ x, y, life: 1, vy: -2.2 });
+}
+
+function updateDrawParticles() {
+  /* 通常パーティクル */
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x  += p.vx;
+    p.y  += p.vy;
+    p.vy += 0.18;
+    p.life -= 0.035;
+    if (p.life <= 0) { particles.splice(i, 1); continue; }
+
+    ctx.save();
+    ctx.globalAlpha = p.life;
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r * p.life, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  /* スコアポップアップ */
+  for (let i = scorePopups.length - 1; i >= 0; i--) {
+    const sp = scorePopups[i];
+    sp.y    += sp.vy;
+    sp.life -= 0.028;
+    if (sp.life <= 0) { scorePopups.splice(i, 1); continue; }
+
+    ctx.save();
+    ctx.globalAlpha = sp.life;
+    ctx.font = 'bold 22px Arial';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.strokeStyle = '#c05700';
+    ctx.lineWidth = 4;
+    ctx.strokeText('+1', sp.x, sp.y);
+    ctx.fillStyle = '#ffd700';
+    ctx.fillText('+1', sp.x, sp.y);
+    ctx.restore();
+  }
+}
+
+/* =====================================================
+   背景描画（空・雲・地面）
+   ===================================================== */
+let clouds = [];
+
+function initClouds() {
+  clouds = [];
+  for (let i = 0; i < 6; i++) {
+    clouds.push({
+      x:    Math.random() * CFG.W,
+      y:    20 + Math.random() * (CFG.H * 0.38),
+      size: 30 + Math.random() * 45,
+      spd:  0.25 + Math.random() * 0.45,
+    });
+  }
+}
+
+function drawBackground() {
+  /* 空のグラデーション */
+  const sky = ctx.createLinearGradient(0, 0, 0, CFG.H - CFG.GROUND_H);
+  sky.addColorStop(0, CFG.SKY_TOP);
+  sky.addColorStop(1, CFG.SKY_BTM);
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, CFG.W, CFG.H - CFG.GROUND_H);
+
+  /* 雲 */
+  clouds.forEach(c => {
+    if (state === STATE.PLAYING) {
+      c.x -= c.spd;
+      if (c.x + c.size * 3 < 0) {
+        c.x    = CFG.W + c.size;
+        c.y    = 20 + Math.random() * (CFG.H * 0.35);
+        c.size = 30 + Math.random() * 45;
+      }
+    }
+    drawCloud(c.x, c.y, c.size);
+  });
+
+  drawGround();
+}
+
+function drawCloud(x, y, s) {
+  ctx.save();
+  ctx.fillStyle = CFG.CLOUD_CLR;
+  ctx.beginPath();
+  ctx.arc(x,           y,           s * 0.52, 0, Math.PI * 2);
+  ctx.arc(x + s * 0.42, y - s * 0.12, s * 0.40, 0, Math.PI * 2);
+  ctx.arc(x + s * 0.82, y,           s * 0.36, 0, Math.PI * 2);
+  ctx.arc(x + s * 0.42, y + s * 0.12, s * 0.44, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawGround() {
+  const gy = CFG.H - CFG.GROUND_H;
+
+  /* 芝生グラデーション */
+  const grd = ctx.createLinearGradient(0, gy, 0, CFG.H);
+  grd.addColorStop(0,   CFG.GROUND_TOP);
+  grd.addColorStop(0.25, CFG.GROUND_BOT);
+  grd.addColorStop(1,   '#2d6117');
+  ctx.fillStyle = grd;
+  ctx.fillRect(0, gy, CFG.W, CFG.GROUND_H);
+
+  /* 境界線 */
+  ctx.fillStyle = CFG.GROUND_LINE;
+  ctx.fillRect(0, gy, CFG.W, 6);
+
+  /* 地面ストライプ（スクロール） */
+  bgOfs = (bgOfs + speed) % 50;
+  ctx.fillStyle = 'rgba(0,0,0,0.08)';
+  for (let x = -bgOfs; x < CFG.W; x += 50) {
+    ctx.fillRect(x, gy + 14, 24, 5);
+    ctx.fillRect(x + 28, gy + 28, 16, 4);
+  }
+
+  /* 小石の点描 */
+  ctx.fillStyle = 'rgba(255,255,255,0.18)';
+  for (let x = -bgOfs * 0.7; x < CFG.W; x += 70) {
+    ctx.beginPath();
+    ctx.ellipse(x + 10, gy + 22, 5, 3, 0.3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+/* =====================================================
+   HUD（スコア・速度インジケーター）
+   ===================================================== */
+function drawHUD() {
+  /* スコアパネル */
+  ctx.save();
+  ctx.fillStyle = 'rgba(255,255,255,0.75)';
+  fillRoundRect(10, 10, 175, 60, 12);
+
+  ctx.fillStyle = '#333';
+  ctx.font = 'bold 22px Arial';
+  ctx.textAlign = 'left';
+  ctx.fillText(`スコア: ${Math.floor(score)}`, 18, 36);
+
+  ctx.fillStyle = '#888';
+  ctx.font = '14px Arial';
+  ctx.fillText(`ベスト: ${best}`, 18, 58);
+
+  /* 速度インジケーター（星で表示）*/
+  const starFill = Math.ceil(((speed - CFG.SPEED_INIT) / (CFG.SPEED_MAX - CFG.SPEED_INIT)) * 5);
+  ctx.fillStyle = 'rgba(255,255,255,0.75)';
+  fillRoundRect(CFG.W - 145, 10, 135, 44, 12);
+
+  ctx.font = '13px Arial';
+  ctx.fillStyle = '#555';
+  ctx.textAlign = 'right';
+  ctx.fillText('スピード', CFG.W - 14, 26);
+  ctx.font = '18px serif';
+  const stars = '★'.repeat(Math.min(starFill + 1, 5)) + '☆'.repeat(Math.max(0, 5 - starFill - 1));
+  ctx.fillStyle = '#f39c12';
+  ctx.fillText(stars, CFG.W - 12, 46);
+
+  ctx.restore();
+}
+
+/* =====================================================
+   タイトル画面
+   ===================================================== */
+let titleT = 0; // タイトルアニメーション用タイマー
+
+function drawTitle() {
+  titleT += 0.05;
+
+  /* 暗幕 */
+  ctx.fillStyle = 'rgba(0,0,0,0.28)';
+  ctx.fillRect(0, 0, CFG.W, CFG.H);
+
+  /* パネル */
+  ctx.save();
+  const pw = 420, ph = 280;
+  const px = CFG.W / 2 - pw / 2;
+  const py = CFG.H / 2 - ph / 2;
+
+  ctx.fillStyle = 'rgba(255,255,255,0.96)';
+  fillRoundRect(px, py, pw, ph, 24);
+
+  /* タイトル文字（上下バウンド） */
+  const bounce = Math.sin(titleT * 1.6) * 6;
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 44px Arial';
+  ctx.fillStyle = '#ff6b6b';
+  ctx.fillText('🐥 ジャンプ！', CFG.W / 2, py + 68 + bounce);
+
+  ctx.font = '18px Arial';
+  ctx.fillStyle = '#555';
+  ctx.fillText('障害物をジャンプで避けよう！', CFG.W / 2, py + 108);
+
+  /* 操作説明 */
+  ctx.font = '15px Arial';
+  ctx.fillStyle = '#888';
+  ctx.fillText('⌨️  スペース / ↑キー　　📱 画面タップ', CFG.W / 2, py + 142);
+
+  /* スタートボタン（色が脈打つ） */
+  const pulse = 0.75 + Math.sin(titleT * 2.5) * 0.25;
+  const btnY  = py + 168;
+
+  const btnGrd = ctx.createLinearGradient(CFG.W / 2 - 115, btnY, CFG.W / 2 + 115, btnY + 52);
+  btnGrd.addColorStop(0, `rgba(255,107,107,${pulse})`);
+  btnGrd.addColorStop(1, `rgba(255,154,76,${pulse})`);
+  ctx.fillStyle = btnGrd;
+  fillRoundRect(CFG.W / 2 - 115, btnY, 230, 52, 26);
+
+  ctx.fillStyle = 'white';
+  ctx.font = 'bold 22px Arial';
+  ctx.fillText('▶  スタート！', CFG.W / 2, btnY + 33);
+
+  /* ベストスコア表示 */
+  if (best > 0) {
+    ctx.fillStyle = '#aaa';
+    ctx.font = '14px Arial';
+    ctx.fillText(`ベストスコア: ${best} 点`, CFG.W / 2, py + 258);
+  }
+
+  ctx.restore();
+}
+
+/* =====================================================
+   ゲームオーバー画面
+   ===================================================== */
+let overT  = 0;  // ゲームオーバーアニメーション用タイマー
+let panelY = -320; // パネルのY座標（スライドイン）
+const PANEL_TARGET_Y = CFG.H / 2 - 160;
+
+function drawGameOver() {
+  overT += 0.05;
+
+  /* パネルのスライドイン */
+  panelY += (PANEL_TARGET_Y - panelY) * 0.14;
+
+  /* 暗幕 */
+  ctx.fillStyle = 'rgba(0,0,0,0.38)';
+  ctx.fillRect(0, 0, CFG.W, CFG.H);
+
+  /* パネル */
+  ctx.save();
+  const pw = 420, ph = 320;
+  const px = CFG.W / 2 - pw / 2;
+
+  ctx.fillStyle = 'rgba(255,255,255,0.97)';
+  fillRoundRect(px, panelY, pw, ph, 24);
+
+  ctx.textAlign = 'center';
+
+  /* ゲームオーバータイトル（最初だけ横振れ） */
+  const shake = Math.sin(overT * 18) * Math.max(0, 1.5 - overT) * 6;
+  ctx.font = 'bold 36px Arial';
+  ctx.fillStyle = '#e74c3c';
+  ctx.fillText('💀 ゲームオーバー！', CFG.W / 2 + shake, panelY + 58);
+
+  /* 今回のスコア */
+  ctx.font = 'bold 28px Arial';
+  ctx.fillStyle = '#333';
+  ctx.fillText(`スコア　${Math.floor(score)} 点`, CFG.W / 2, panelY + 108);
+
+  /* ベストスコア・新記録判定 */
+  const isNew = Math.floor(score) >= best && best > 0;
+  if (isNew) {
+    const sc = 1 + Math.sin(overT * 3) * 0.1;
+    ctx.save();
+    ctx.translate(CFG.W / 2, panelY + 148);
+    ctx.scale(sc, sc);
+    ctx.font = 'bold 22px Arial';
+    ctx.fillStyle = '#f1c40f';
+    ctx.fillText('🏆  新記録！', 0, 0);
+    ctx.restore();
+  }
+
+  ctx.font = '18px Arial';
+  ctx.fillStyle = '#999';
+  ctx.fillText(`ベストスコア: ${best} 点`, CFG.W / 2, panelY + 180);
+
+  /* 区切り */
+  ctx.strokeStyle = '#eee';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(px + 30, panelY + 200);
+  ctx.lineTo(px + pw - 30, panelY + 200);
+  ctx.stroke();
+
+  /* リトライボタン */
+  const bx = CFG.W / 2 - 125;
+  const by = panelY + 216;
+  const bw = 250, bh = 58;
+  const bhv = Math.sin(overT * 2.2) * 3; // ボタンが少し上下する
+
+  const bGrd = ctx.createLinearGradient(bx, by + bhv, bx, by + bh + bhv);
+  bGrd.addColorStop(0, '#2ecc71');
+  bGrd.addColorStop(1, '#27ae60');
+  ctx.fillStyle = bGrd;
+  fillRoundRect(bx, by + bhv, bw, bh, 29);
+
+  /* ボタンの光沢 */
+  ctx.fillStyle = 'rgba(255,255,255,0.25)';
+  fillRoundRect(bx + 6, by + bhv + 5, bw - 12, bh * 0.42, 20);
+
+  ctx.fillStyle = 'white';
+  ctx.font = 'bold 23px Arial';
+  ctx.fillText('🔄  もう一度！', CFG.W / 2, by + 36 + bhv);
+
+  ctx.restore();
+
+  /* リトライボタン領域をグローバルに記録（クリック判定用） */
+  retryBtn = { x: bx, y: by, w: bw, h: bh };
+}
+
+let retryBtn = null; // リトライボタンの座標
+
+/* =====================================================
+   ゲームの開始・リセット
+   ===================================================== */
+function startGame() {
+  state      = STATE.PLAYING;
+  score      = 0;
+  speed      = CFG.SPEED_INIT;
+  frame      = 0;
+  bgOfs      = 0;
+  nextObsDist = CFG.FIRST_OBS;
+  obstacles  = [];
+  particles  = [];
+  scorePopups = [];
+  panelY     = -320;
+  overT      = 0;
+  retryBtn   = null;
+  player.reset();
+}
+
+function triggerGameOver() {
+  state = STATE.OVER;
+  /* ベストスコアの更新 */
+  const s = Math.floor(score);
+  if (s > best) {
+    best = s;
+    localStorage.setItem('jtg_best', String(best));
+  }
+  /* 爆発パーティクル */
+  spawnDeathParticles(player.x + player.w / 2, player.y + player.h / 2);
+}
+
+/* =====================================================
+   入力処理
+   ===================================================== */
+/* スケール変換（キャンバスがCSSで縮小されている場合に対応） */
+function toCanvasXY(clientX, clientY) {
+  const r = canvas.getBoundingClientRect();
+  return {
+    x: (clientX - r.left) * (CFG.W / r.width),
+    y: (clientY - r.top)  * (CFG.H / r.height),
+  };
+}
+
+function handleInput(cx, cy) {
+  if (state === STATE.TITLE) {
+    startGame();
+  } else if (state === STATE.PLAYING) {
+    player.jump();
+  } else if (state === STATE.OVER) {
+    /* リトライボタンのヒット判定（パネルがスライドインしきってから） */
+    if (retryBtn && cx >= retryBtn.x && cx <= retryBtn.x + retryBtn.w &&
+        cy >= retryBtn.y && cy <= retryBtn.y + retryBtn.h) {
+      startGame();
+    } else if (panelY > PANEL_TARGET_Y - 20) {
+      /* パネル外のタップでもリトライ */
+      startGame();
+    }
+  }
+}
+
+document.addEventListener('keydown', e => {
+  if (e.code === 'Space' || e.code === 'ArrowUp') {
+    e.preventDefault();
+    handleInput(0, 0);
+  }
+});
+
+canvas.addEventListener('click', e => {
+  const { x, y } = toCanvasXY(e.clientX, e.clientY);
+  handleInput(x, y);
+});
+
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  const t = e.touches[0];
+  const { x, y } = toCanvasXY(t.clientX, t.clientY);
+  handleInput(x, y);
+}, { passive: false });
+
+/* =====================================================
+   ユーティリティ：角丸四角形の塗りつぶし
+   ===================================================== */
+function fillRoundRect(x, y, w, h, r, color) {
+  if (color) ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y,     x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r,     y + h);
+  ctx.quadraticCurveTo(x,     y + h, x,     y + h - r);
+  ctx.lineTo(x,         y + r);
+  ctx.quadraticCurveTo(x,     y,     x + r, y);
+  ctx.closePath();
+  ctx.fill();
+}
+
+/* =====================================================
+   メインゲームループ
+   ===================================================== */
+function loop() {
+  ctx.clearRect(0, 0, CFG.W, CFG.H);
+
+  /* 背景は常に描画 */
+  drawBackground();
+
+  if (state === STATE.PLAYING) {
+    frame++;
+
+    /* スコアと速度の更新 */
+    score += CFG.SCORE_RATE;
+    if (speed < CFG.SPEED_MAX) speed += CFG.SPEED_INC;
+
+    /* プレイヤーと障害物の更新 */
+    player.update();
+    updateObstacles();
+
+    /* 衝突判定 */
+    if (checkCollision()) triggerGameOver();
+  }
+
+  /* 障害物・プレイヤーの描画 */
+  drawObstacles();
+  player.draw();
+
+  /* パーティクルの更新・描画 */
+  updateDrawParticles();
+
+  /* 画面ごとの UI 描画 */
+  if (state === STATE.PLAYING) {
+    drawHUD();
+  } else if (state === STATE.TITLE) {
+    drawTitle();
+  } else if (state === STATE.OVER) {
+    drawHUD();
+    drawGameOver();
+  }
+
+  requestAnimationFrame(loop);
+}
+
+/* =====================================================
+   ゲームの初期化
+   ===================================================== */
+initClouds();
+player.reset();
+loop(); // ゲームループ開始
+</script>
+</body>
+</html>
