@@ -70,9 +70,10 @@ const CFG = {
   /* ── 障害物 ── */
   OBS_W: 52,          // 障害物の幅
   OBS_MIN_H: 45,      // 障害物の最小高さ
-  OBS_MAX_H: 130,     // 障害物の最大高さ
-  OBS_MIN_GAP: 220,   // 障害物の最小間隔 (px)
-  OBS_MAX_GAP: 380,   // 障害物の最大間隔 (px)
+  OBS_MAX_H: 120,     // 障害物の最大高さ（通常）
+  OBS_TALL_H: 155,    // 高い障害物の最大高さ（最大ジャンプ高さ181px以内・余裕30px確保）
+  OBS_MIN_GAP_F: 65,  // 障害物の最小出現間隔（フレーム数）── ジャンプ46F＋余裕
+  OBS_MAX_GAP_F: 115, // 障害物の最大出現間隔（フレーム数）
   FIRST_OBS: 320,     // 最初の障害物が出るまでの距離
 
   /* ── 速度 ── */
@@ -97,6 +98,16 @@ const CFG = {
 
   /* 障害物カラーリスト */
   OBS_COLORS: ['#ff6b6b','#ff9f43','#a29bfe','#00cec9','#fd79a8','#6c5ce7'],
+
+  /* ── アイテム ── */
+  COIN_SCORE:     500,   // コイン取得スコア
+  STAR_DURATION:  300,   // 無敵フレーム数（5秒 @ 60fps）
+  ITEM_SIZE:       36,   // アイテム絵文字の描画サイズ
+  ITEM_MIN_GAP_F: 150,   // アイテム出現最小間隔（フレーム数）
+  ITEM_MAX_GAP_F: 260,   // アイテム出現最大間隔（フレーム数）
+  ITEM_MIN_H:      55,   // 地面からの最小浮遊高さ (px)
+  ITEM_MAX_H:     165,   // 地面からの最大浮遊高さ (px)
+  ITEM_OBS_CLEAR:  80,   // 障害物との最小X距離（重複防止 px）
 };
 
 /* =====================================================
@@ -127,6 +138,10 @@ let speed      = CFG.SPEED_INIT;
 let frame      = 0;         // フレームカウンター（アニメーション用）
 let bgOfs      = 0;         // 地面スクロールオフセット
 let nextObsDist = CFG.FIRST_OBS; // 次の障害物までの距離カウンター
+let items          = [];          // アイテム配列
+let nextItemDist   = 0;           // 次のアイテムまでの距離カウンター
+let invincibleFrames = 0;         // 無敵残りフレーム数（0=通常）
+let textPopups     = [];          // アイテム取得テキストポップアップ
 
 /* =====================================================
    プレイヤーオブジェクト
@@ -197,13 +212,36 @@ const player = {
     ctx.fill();
     ctx.restore();
 
-    /* プレイヤー絵文字 */
-    ctx.translate(this.x + this.w / 2, this.y + this.h / 2);
-    ctx.rotate(rot);
-    ctx.font = `${CFG.PLAYER_SIZE}px serif`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText('🐥', 0, 0);
+    /* 無敵オーラ（虹色ラジアルグラデーション・絵文字の後ろに描画） */
+    if (invincibleFrames > 0) {
+      const cx  = this.x + this.w / 2;
+      const cy  = this.y + this.h / 2;
+      const r   = this.w * 0.75;
+      const hue = (frame * 6) % 360;
+      const grd = ctx.createRadialGradient(cx, cy, r * 0.25, cx, cy, r);
+      grd.addColorStop(0,   `hsla(${hue},              100%, 70%, 0.6)`);
+      grd.addColorStop(0.5, `hsla(${(hue + 120) % 360},100%, 65%, 0.35)`);
+      grd.addColorStop(1,   `hsla(${(hue + 240) % 360},100%, 60%, 0)`);
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.fillStyle = grd;
+      ctx.fill();
+      ctx.restore();
+    }
+
+    /* プレイヤー絵文字（無敵中は点滅） */
+    /* 通常: 4フレーム周期、残り60F以下は2フレーム周期で警告点滅 */
+    const blinkRate = invincibleFrames > 60 ? 4 : 2;
+    const blink     = invincibleFrames > 0 && (frame % blinkRate < Math.floor(blinkRate / 2));
+    if (!blink) {
+      ctx.translate(this.x + this.w / 2, this.y + this.h / 2);
+      ctx.rotate(rot);
+      ctx.font = `${CFG.PLAYER_SIZE}px serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('🐥', 0, 0);
+    }
 
     ctx.restore();
   },
@@ -216,10 +254,10 @@ let obstacles = [];
 
 function spawnObstacle() {
   /* 高い障害物を20%の確率で生成 */
+  /* OBS_TALL_H (155px) は最大ジャンプ高さ(181px)より低いので必ず飛び越えられる */
   const tall = Math.random() < 0.2;
-  const h = tall
-    ? CFG.OBS_MAX_H * 1.6
-    : CFG.OBS_MIN_H + Math.random() * (CFG.OBS_MAX_H - CFG.OBS_MIN_H);
+  const maxH = tall ? CFG.OBS_TALL_H : CFG.OBS_MAX_H;
+  const h = CFG.OBS_MIN_H + Math.random() * (maxH - CFG.OBS_MIN_H);
 
   obstacles.push({
     x:      CFG.W + 60,
@@ -230,6 +268,32 @@ function spawnObstacle() {
     color:  CFG.OBS_COLORS[Math.floor(Math.random() * CFG.OBS_COLORS.length)],
     emoji:  tall ? '🌵' : (Math.random() < 0.5 ? '📦' : '🪨'),
     phase:  Math.random() * Math.PI * 2, // 揺れ位相
+  });
+}
+
+function spawnItem() {
+  /* 障害物がスポーン地点付近（±ITEM_OBS_CLEAR）にいれば短時間遅延して再試行 */
+  const spawnX = CFG.W + 60;
+  for (const o of obstacles) {
+    if (Math.abs(o.x - spawnX) < CFG.ITEM_OBS_CLEAR) {
+      nextItemDist = 30; // ~30フレーム後に再試行
+      return;
+    }
+  }
+
+  /* コイン65% / スター35% */
+  const type    = Math.random() < 0.65 ? 'coin' : 'star';
+  const groundY = CFG.H - CFG.GROUND_H;
+  const floatH  = CFG.ITEM_MIN_H + Math.random() * (CFG.ITEM_MAX_H - CFG.ITEM_MIN_H);
+
+  items.push({
+    x:     spawnX,
+    y:     groundY - floatH - CFG.ITEM_SIZE,
+    w:     CFG.ITEM_SIZE,
+    h:     CFG.ITEM_SIZE,
+    type,
+    emoji: type === 'coin' ? '🪙' : '🌟',
+    phase: Math.random() * Math.PI * 2, // 浮遊アニメーション位相
   });
 }
 
@@ -253,10 +317,10 @@ function updateObstacles() {
   nextObsDist -= speed;
   if (nextObsDist <= 0) {
     spawnObstacle();
-    /* 速度が上がるほど間隔が縮まる */
-    const ratio = (speed - CFG.SPEED_INIT) / (CFG.SPEED_MAX - CFG.SPEED_INIT);
-    const gap = CFG.OBS_MIN_GAP + (CFG.OBS_MAX_GAP - CFG.OBS_MIN_GAP) * (1 - ratio * 0.5);
-    nextObsDist = gap + Math.random() * 60;
+    /* フレーム数で間隔を管理することで、速度が上がっても同じ「時間的余裕」を保証する */
+    /* gapFrames * speed → ピクセル距離はスピードに比例して広がる（時間は一定）    */
+    const gapFrames = CFG.OBS_MIN_GAP_F + Math.random() * (CFG.OBS_MAX_GAP_F - CFG.OBS_MIN_GAP_F);
+    nextObsDist = gapFrames * speed;
   }
 }
 
@@ -292,9 +356,72 @@ function drawObstacles() {
 }
 
 /* =====================================================
+   アイテム管理
+   ===================================================== */
+function updateItems() {
+  /* スポーンタイミング */
+  nextItemDist -= speed;
+  if (nextItemDist <= 0) {
+    spawnItem();
+    const gapFrames = CFG.ITEM_MIN_GAP_F + Math.random() * (CFG.ITEM_MAX_GAP_F - CFG.ITEM_MIN_GAP_F);
+    nextItemDist = gapFrames * speed;
+  }
+
+  const p = player.hitbox();
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    it.x    -= speed;
+    it.phase += 0.07;
+
+    /* 画面外削除 */
+    if (it.x + it.w < 0) { items.splice(i, 1); continue; }
+
+    /* プレイヤーとのAABB衝突 */
+    if (p.x < it.x + it.w && p.x + p.w > it.x &&
+        p.y < it.y + it.h && p.y + p.h > it.y) {
+      collectItem(it, i);
+    }
+  }
+}
+
+function collectItem(item, index) {
+  items.splice(index, 1);
+  const cx = item.x + item.w / 2;
+  const cy = item.y + item.h / 2;
+
+  if (item.type === 'coin') {
+    score += CFG.COIN_SCORE;
+    spawnTextPopup(player.x + player.w / 2, player.y - 8, '+500!', '#ffd700');
+    spawnCollectBurst(cx, cy, '#ffd700');
+  } else {
+    invincibleFrames = CFG.STAR_DURATION;
+    spawnTextPopup(player.x + player.w / 2, player.y - 8, '無敵！', '#c084fc');
+    spawnCollectBurst(cx, cy, '#c084fc');
+  }
+}
+
+function drawItems() {
+  items.forEach(it => {
+    const bob = Math.sin(it.phase) * 5;
+    const cx  = it.x + it.w / 2;
+    const cy  = it.y + it.h / 2 + bob;
+
+    ctx.save();
+    ctx.shadowColor = it.type === 'coin' ? 'rgba(255,215,0,0.8)' : 'rgba(192,132,252,0.8)';
+    ctx.shadowBlur  = 18;
+    ctx.font        = `${CFG.ITEM_SIZE}px serif`;
+    ctx.textAlign   = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(it.emoji, cx, cy);
+    ctx.restore();
+  });
+}
+
+/* =====================================================
    衝突判定（AABB）
    ===================================================== */
 function checkCollision() {
+  if (invincibleFrames > 0) return false; // 無敵中は障害物をすり抜ける
   const p = player.hitbox();
   for (const o of obstacles) {
     if (
@@ -346,6 +473,27 @@ function spawnScorePopup(x, y) {
   scorePopups.push({ x, y, life: 1, vy: -2.2 });
 }
 
+/* アイテム取得テキストポップアップ */
+function spawnTextPopup(x, y, text, color) {
+  textPopups.push({ x, y, text, color, life: 1, vy: -2.5 });
+}
+
+/* アイテム取得時の放射状バースト（既存 particles[] を再利用） */
+function spawnCollectBurst(x, y, color) {
+  for (let i = 0; i < 10; i++) {
+    const angle = (Math.PI * 2 / 10) * i;
+    const spd   = Math.random() * 3.5 + 1.5;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * spd,
+      vy: Math.sin(angle) * spd - 1.5,
+      r:  Math.random() * 5 + 2,
+      color,
+      life: 1,
+    });
+  }
+}
+
 function updateDrawParticles() {
   /* 通常パーティクル */
   for (let i = particles.length - 1; i >= 0; i--) {
@@ -382,6 +530,26 @@ function updateDrawParticles() {
     ctx.strokeText('+1', sp.x, sp.y);
     ctx.fillStyle = '#ffd700';
     ctx.fillText('+1', sp.x, sp.y);
+    ctx.restore();
+  }
+
+  /* アイテム取得テキストポップアップ */
+  for (let i = textPopups.length - 1; i >= 0; i--) {
+    const tp = textPopups[i];
+    tp.y    += tp.vy;
+    tp.life -= 0.020;
+    if (tp.life <= 0) { textPopups.splice(i, 1); continue; }
+
+    ctx.save();
+    ctx.globalAlpha  = tp.life;
+    ctx.font         = 'bold 28px Arial';
+    ctx.textAlign    = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.strokeStyle  = 'rgba(0,0,0,0.6)';
+    ctx.lineWidth    = 5;
+    ctx.strokeText(tp.text, tp.x, tp.y);
+    ctx.fillStyle    = tp.color;
+    ctx.fillText(tp.text, tp.x, tp.y);
     ctx.restore();
   }
 }
@@ -502,6 +670,29 @@ function drawHUD() {
   const stars = '★'.repeat(Math.min(starFill + 1, 5)) + '☆'.repeat(Math.max(0, 5 - starFill - 1));
   ctx.fillStyle = '#f39c12';
   ctx.fillText(stars, CFG.W - 12, 46);
+
+  /* 無敵残り時間インジケーター */
+  if (invincibleFrames > 0) {
+    const ratio    = invincibleFrames / CFG.STAR_DURATION;
+    const secsLeft = Math.ceil(invincibleFrames / 60);
+    const hue      = (frame * 6) % 360;
+
+    /* 背景パネル（スコアパネルを縦に拡張） */
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    fillRoundRect(10, 72, 175, 36, 12);
+
+    /* テキスト */
+    ctx.font      = 'bold 14px Arial';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = `hsl(${hue},100%,40%)`;
+    ctx.fillText(`🌟 無敵 ${secsLeft}秒`, 18, 88);
+
+    /* プログレスバー（残り時間を視覚化） */
+    ctx.fillStyle = 'rgba(0,0,0,0.12)';
+    fillRoundRect(18, 96, 148, 6, 3);
+    ctx.fillStyle = `hsl(${hue},100%,55%)`;
+    fillRoundRect(18, 96, 148 * ratio, 6, 3);
+  }
 
   ctx.restore();
 }
@@ -667,13 +858,18 @@ function startGame() {
   speed      = CFG.SPEED_INIT;
   frame      = 0;
   bgOfs      = 0;
-  nextObsDist = CFG.FIRST_OBS;
-  obstacles  = [];
-  particles  = [];
-  scorePopups = [];
-  panelY     = -320;
-  overT      = 0;
-  retryBtn   = null;
+  nextObsDist      = CFG.FIRST_OBS;
+  obstacles        = [];
+  particles        = [];
+  scorePopups      = [];
+  items            = [];
+  textPopups       = [];
+  invincibleFrames = 0;
+  /* アイテムは最初の障害物より後に、一定距離置いて出現させる */
+  nextItemDist     = CFG.FIRST_OBS + CFG.ITEM_MIN_GAP_F * CFG.SPEED_INIT;
+  panelY           = -320;
+  overT            = 0;
+  retryBtn         = null;
   player.reset();
 }
 
@@ -772,16 +968,21 @@ function loop() {
     score += CFG.SCORE_RATE;
     if (speed < CFG.SPEED_MAX) speed += CFG.SPEED_INC;
 
-    /* プレイヤーと障害物の更新 */
+    /* プレイヤーと障害物・アイテムの更新 */
     player.update();
     updateObstacles();
+    updateItems();
 
-    /* 衝突判定 */
+    /* 無敵カウントダウン */
+    if (invincibleFrames > 0) invincibleFrames--;
+
+    /* 衝突判定（checkCollision内で無敵中はスキップ） */
     if (checkCollision()) triggerGameOver();
   }
 
-  /* 障害物・プレイヤーの描画 */
+  /* 障害物・アイテム・プレイヤーの描画 */
   drawObstacles();
+  drawItems();
   player.draw();
 
   /* パーティクルの更新・描画 */
