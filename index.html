@@ -67,14 +67,21 @@ const CFG = {
   /* ── 地面 ── */
   GROUND_H: 72,       // 地面の高さ
 
-  /* ── 障害物 ── */
+  /* ── 障害物（地面系）── */
   OBS_W: 52,          // 障害物の幅
   OBS_MIN_H: 45,      // 障害物の最小高さ
-  OBS_MAX_H: 120,     // 障害物の最大高さ（通常）
-  OBS_TALL_H: 155,    // 高い障害物の最大高さ（最大ジャンプ高さ181px以内・余裕30px確保）
+  OBS_MAX_H: 120,     // ノーマル障害物の最大高さ（小ジャンプで越えられる）
+  OBS_TALL_H: 155,    // トール障害物の最大高さ（最大ジャンプ高さ181px以内・余裕30px確保）
   OBS_MIN_GAP_F: 65,  // 障害物の最小出現間隔（フレーム数）── ジャンプ46F＋余裕
   OBS_MAX_GAP_F: 115, // 障害物の最大出現間隔（フレーム数）
   FIRST_OBS: 320,     // 最初の障害物が出るまでの距離
+
+  /* ── 障害物（フライング系）── */
+  FLY_H: 44,          // フライング障害物の高さ
+  FLY_Y_MIN: 90,      // フライング障害物の上端Y最小値（キャンバス上端から）
+  FLY_Y_MAX: 200,     // フライング障害物の上端Y最大値（上端200+高さ44=下端244 < 地面プレイヤー判定306）
+  /* FLY_Y_MAX+FLY_H=244 < プレイヤー地上ヒットボックス上端306 → 地面走行時は絶対に当たらない */
+  FLY_AFTER_GND_GAP_F: 90, // 地面系→フライング時の最小間隔（着地後の反応時間を十分確保）
 
   /* ── 速度 ── */
   SPEED_INIT: 4.2,    // 初期スクロール速度
@@ -98,6 +105,8 @@ const CFG = {
 
   /* 障害物カラーリスト */
   OBS_COLORS: ['#ff6b6b','#ff9f43','#a29bfe','#00cec9','#fd79a8','#6c5ce7'],
+  /* フライング障害物専用カラー（青紫系） */
+  FLY_COLORS: ['#a29bfe','#6c5ce7','#74b9ff','#0984e3','#fd79a8'],
 
   /* ── アイテム ── */
   COIN_SCORE:     500,   // コイン取得スコア
@@ -108,6 +117,7 @@ const CFG = {
   ITEM_MIN_H:      55,   // 地面からの最小浮遊高さ (px)
   ITEM_MAX_H:     165,   // 地面からの最大浮遊高さ (px)
   ITEM_OBS_CLEAR:  80,   // 障害物との最小X距離（重複防止 px）
+  ITEM_FLY_BUFFER: 15,   // フライング障害物とのY余白（重複防止 px）
 };
 
 /* =====================================================
@@ -138,6 +148,7 @@ let speed      = CFG.SPEED_INIT;
 let frame      = 0;         // フレームカウンター（アニメーション用）
 let bgOfs      = 0;         // 地面スクロールオフセット
 let nextObsDist = CFG.FIRST_OBS; // 次の障害物までの距離カウンター
+let lastObsType = 'normal'; // 直前の障害物タイプ（gap計算の公平性チェック用）
 let items          = [];          // アイテム配列
 let nextItemDist   = 0;           // 次のアイテムまでの距離カウンター
 let invincibleFrames = 0;         // 無敵残りフレーム数（0=通常）
@@ -252,56 +263,79 @@ const player = {
    ===================================================== */
 let obstacles = [];
 
-function spawnObstacle() {
-  /* 高い障害物を20%の確率で生成 */
-  /* OBS_TALL_H (155px) は最大ジャンプ高さ(181px)より低いので必ず飛び越えられる */
-  const tall = Math.random() < 0.2;
-  const maxH = tall ? CFG.OBS_TALL_H : CFG.OBS_MAX_H;
-  const h = CFG.OBS_MIN_H + Math.random() * (maxH - CFG.OBS_MIN_H);
-
-  obstacles.push({
-    x:      CFG.W + 60,
-    y:      CFG.H - CFG.GROUND_H - h,
-    w:      CFG.OBS_W,
-    h,
-    passed: false,
-    color:  CFG.OBS_COLORS[Math.floor(Math.random() * CFG.OBS_COLORS.length)],
-    emoji:  tall ? '🌵' : (Math.random() < 0.5 ? '📦' : '🪨'),
-    phase:  Math.random() * Math.PI * 2, // 揺れ位相
-  });
+/*
+ * 障害物タイプの抽選
+ * 'normal' 35% / 'tall' 25% / 'flying' 40%
+ */
+function pickObsType() {
+  const r = Math.random();
+  if (r < 0.35) return 'normal';
+  if (r < 0.60) return 'tall';
+  return 'flying';
 }
 
-function spawnItem() {
-  /* 障害物がスポーン地点付近（±ITEM_OBS_CLEAR）にいれば短時間遅延して再試行 */
-  const spawnX = CFG.W + 60;
-  for (const o of obstacles) {
-    if (Math.abs(o.x - spawnX) < CFG.ITEM_OBS_CLEAR) {
-      nextItemDist = 30; // ~30フレーム後に再試行
-      return;
-    }
+/*
+ * タイプの組み合わせによる最小ギャップフレーム数を返す
+ *
+ * 【公平性ルール】
+ * ・地面系（normal/tall）→ フライング の場合:
+ *   プレイヤーはジャンプを強いられた直後にフライングが来るため、
+ *   着地後に「ジャンプしてはいけない」と判断できる十分な時間を確保する。
+ *   最小 FLY_AFTER_GND_GAP_F(90) フレーム = 着地(46F) + 反応時間(44F)
+ *
+ * ・その他の組み合わせ: 通常の OBS_MIN_GAP_F(65) フレーム
+ */
+function obsMinGapF(prevType, nextType) {
+  const isGnd = t => t === 'normal' || t === 'tall';
+  if (isGnd(prevType) && nextType === 'flying') return CFG.FLY_AFTER_GND_GAP_F;
+  return CFG.OBS_MIN_GAP_F;
+}
+
+/*
+ * 指定タイプの障害物をスポーン
+ *
+ * 地面系: groundY から上へ伸びる矩形
+ * フライング: 空中に浮かぶ矩形（地面走行中はプレイヤーヒットボックスと非交差）
+ *   → FLY_Y_MAX + FLY_H = 200 + 44 = 244 < プレイヤー地上ヒットボックス上端(306)
+ *      なので地面を走り続ければ絶対に当たらない
+ */
+function spawnObstacle(type) {
+  const obs = {
+    x:      CFG.W + 60,
+    w:      CFG.OBS_W,
+    passed: false,
+    phase:  Math.random() * Math.PI * 2,
+    type,
+  };
+
+  if (type === 'flying') {
+    obs.y     = CFG.FLY_Y_MIN + Math.random() * (CFG.FLY_Y_MAX - CFG.FLY_Y_MIN);
+    obs.h     = CFG.FLY_H;
+    obs.color = CFG.FLY_COLORS[Math.floor(Math.random() * CFG.FLY_COLORS.length)];
+    obs.emoji = '🛸';
+  } else if (type === 'tall') {
+    const h   = CFG.OBS_MIN_H + Math.random() * (CFG.OBS_TALL_H - CFG.OBS_MIN_H);
+    obs.y     = CFG.H - CFG.GROUND_H - h;
+    obs.h     = h;
+    obs.color = CFG.OBS_COLORS[Math.floor(Math.random() * CFG.OBS_COLORS.length)];
+    obs.emoji = '🧱';
+  } else {
+    const h   = CFG.OBS_MIN_H + Math.random() * (CFG.OBS_MAX_H - CFG.OBS_MIN_H);
+    obs.y     = CFG.H - CFG.GROUND_H - h;
+    obs.h     = h;
+    obs.color = CFG.OBS_COLORS[Math.floor(Math.random() * CFG.OBS_COLORS.length)];
+    obs.emoji = Math.random() < 0.5 ? '📦' : '🪨';
   }
 
-  /* コイン65% / スター35% */
-  const type    = Math.random() < 0.65 ? 'coin' : 'star';
-  const groundY = CFG.H - CFG.GROUND_H;
-  const floatH  = CFG.ITEM_MIN_H + Math.random() * (CFG.ITEM_MAX_H - CFG.ITEM_MIN_H);
-
-  items.push({
-    x:     spawnX,
-    y:     groundY - floatH - CFG.ITEM_SIZE,
-    w:     CFG.ITEM_SIZE,
-    h:     CFG.ITEM_SIZE,
-    type,
-    emoji: type === 'coin' ? '🪙' : '🌟',
-    phase: Math.random() * Math.PI * 2, // 浮遊アニメーション位相
-  });
+  obstacles.push(obs);
 }
 
 function updateObstacles() {
   for (let i = obstacles.length - 1; i >= 0; i--) {
     const o = obstacles[i];
     o.x -= speed;
-    o.phase += 0.06;
+    /* フライングは緩やかに浮遊、地面系はポップに揺れる */
+    o.phase += o.type === 'flying' ? 0.04 : 0.06;
 
     /* 画面外に出たら削除 */
     if (o.x + o.w < 0) { obstacles.splice(i, 1); continue; }
@@ -316,41 +350,107 @@ function updateObstacles() {
   /* 新しい障害物の出現タイミング */
   nextObsDist -= speed;
   if (nextObsDist <= 0) {
-    spawnObstacle();
-    /* フレーム数で間隔を管理することで、速度が上がっても同じ「時間的余裕」を保証する */
-    /* gapFrames * speed → ピクセル距離はスピードに比例して広がる（時間は一定）    */
-    const gapFrames = CFG.OBS_MIN_GAP_F + Math.random() * (CFG.OBS_MAX_GAP_F - CFG.OBS_MIN_GAP_F);
+    const newType   = pickObsType();
+    const minGap    = obsMinGapF(lastObsType, newType);
+    spawnObstacle(newType);
+    lastObsType = newType;
+    /* gapFrames * speed → ピクセル距離はスピードに比例して広がる（時間的余裕は一定） */
+    const gapFrames = minGap + Math.random() * (CFG.OBS_MAX_GAP_F - minGap);
     nextObsDist = gapFrames * speed;
   }
+}
+
+/* ─── 地面系障害物の描画（📦 ノーマル・🧱 トール）─── */
+function drawGroundObstacle(o) {
+  const wobble = Math.sin(o.phase) * 2;
+
+  /* 影 */
+  ctx.globalAlpha = 0.18;
+  ctx.fillStyle = '#000';
+  fillRoundRect(o.x + 5, o.y + 8 + wobble, o.w, o.h, 10);
+  ctx.globalAlpha = 1;
+
+  /* 本体 */
+  ctx.fillStyle = o.color;
+  fillRoundRect(o.x, o.y + wobble, o.w, o.h, 10);
+
+  /* ハイライト */
+  ctx.fillStyle = 'rgba(255,255,255,0.35)';
+  fillRoundRect(o.x + 5, o.y + 5 + wobble, o.w - 10, o.h * 0.28, 7);
+
+  /* 🧱 トール専用: レンガ模様（横線＋交互の縦線） */
+  if (o.type === 'tall') {
+    ctx.fillStyle = 'rgba(0,0,0,0.14)';
+    const brickH = 18;
+    for (let row = 0; row * brickH < o.h - 4; row++) {
+      const ry     = o.y + wobble + row * brickH;
+      const offset = row % 2 === 0 ? 0 : o.w * 0.5;
+      /* 水平の目地 */
+      ctx.fillRect(o.x + 2, ry, o.w - 4, 2);
+      /* 垂直の目地（千鳥配置） */
+      ctx.fillRect(o.x + offset + o.w * 0.5 - 1, ry + 2, 2, brickH - 2);
+    }
+  }
+
+  /* 絵文字アイコン */
+  ctx.font = '28px serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(o.emoji, o.x + o.w / 2, o.y + o.h / 2 + wobble);
+}
+
+/* ─── フライング障害物の描画（🛸 UFO）─── */
+function drawFlyingObstacle(o) {
+  const bob     = Math.sin(o.phase) * 5; // 浮遊アップダウン
+  const cx      = o.x + o.w / 2;
+  const groundY = CFG.H - CFG.GROUND_H;
+
+  /* 引力ビーム（UFO → 地面へのグラデーションビーム） */
+  ctx.save();
+  ctx.globalAlpha = 0.10;
+  const beamW = o.w * 0.7;
+  const beam  = ctx.createLinearGradient(cx, o.y + o.h + bob, cx, groundY);
+  beam.addColorStop(0, o.color);
+  beam.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = beam;
+  ctx.beginPath();
+  ctx.moveTo(cx - beamW / 2,     o.y + o.h + bob);
+  ctx.lineTo(cx + beamW / 2,     o.y + o.h + bob);
+  ctx.lineTo(cx + beamW * 1.15,  groundY);
+  ctx.lineTo(cx - beamW * 1.15,  groundY);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+
+  /* 本体グロー */
+  ctx.save();
+  ctx.shadowColor = o.color;
+  ctx.shadowBlur  = 20;
+
+  /* 本体 */
+  ctx.fillStyle = o.color;
+  fillRoundRect(o.x, o.y + bob, o.w, o.h, 10);
+
+  ctx.shadowBlur = 0;
+
+  /* ハイライト */
+  ctx.fillStyle = 'rgba(255,255,255,0.42)';
+  fillRoundRect(o.x + 5, o.y + 5 + bob, o.w - 10, o.h * 0.30, 7);
+
+  /* 絵文字 */
+  ctx.font = '28px serif';
+  ctx.textAlign    = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(o.emoji, cx, o.y + o.h / 2 + bob);
+
+  ctx.restore();
 }
 
 function drawObstacles() {
   obstacles.forEach(o => {
     ctx.save();
-
-    /* 軽い揺れ（ポップ感） */
-    const wobble = Math.sin(o.phase) * 2;
-
-    /* 影 */
-    ctx.globalAlpha = 0.18;
-    ctx.fillStyle = '#000';
-    fillRoundRect(o.x + 5, o.y + 8 + wobble, o.w, o.h, 10);
-    ctx.globalAlpha = 1;
-
-    /* 本体 */
-    ctx.fillStyle = o.color;
-    fillRoundRect(o.x, o.y + wobble, o.w, o.h, 10);
-
-    /* ハイライト */
-    ctx.fillStyle = 'rgba(255,255,255,0.35)';
-    fillRoundRect(o.x + 5, o.y + 5 + wobble, o.w - 10, o.h * 0.28, 7);
-
-    /* 絵文字アイコン */
-    ctx.font = '28px serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(o.emoji, o.x + o.w / 2, o.y + o.h / 2 + wobble);
-
+    if (o.type === 'flying') drawFlyingObstacle(o);
+    else drawGroundObstacle(o);
     ctx.restore();
   });
 }
@@ -358,6 +458,60 @@ function drawObstacles() {
 /* =====================================================
    アイテム管理
    ===================================================== */
+function spawnItem() {
+  /* 障害物がスポーン地点付近（±ITEM_OBS_CLEAR）にいれば短時間遅延して再試行 */
+  const spawnX = CFG.W + 60;
+  for (const o of obstacles) {
+    if (Math.abs(o.x - spawnX) < CFG.ITEM_OBS_CLEAR) {
+      nextItemDist = 30; // ~30フレーム後に再試行
+      return;
+    }
+  }
+
+  /* コイン65% / スター35% */
+  const type    = Math.random() < 0.65 ? 'coin' : 'star';
+  const groundY = CFG.H - CFG.GROUND_H;
+
+  /*
+   * フライング障害物との Y 重複を防ぐ（最大5回試行）
+   * 近傍（X距離300px以内）のフライング障害物とY範囲が被らない高さを選ぶ。
+   * 5回試みて解消できない場合は最低高さで強制スポーン（地面寄りになりフライングとは重ならない）。
+   */
+  let floatH = CFG.ITEM_MIN_H + Math.random() * (CFG.ITEM_MAX_H - CFG.ITEM_MIN_H);
+  let itemY   = groundY - floatH - CFG.ITEM_SIZE;
+
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const itemBottom = itemY + CFG.ITEM_SIZE;
+    let hasYOverlap  = false;
+
+    for (const o of obstacles) {
+      if (o.type !== 'flying') continue;
+      if (Math.abs(o.x - spawnX) > 300) continue; // 遠い障害物は無視
+      const buf = CFG.ITEM_FLY_BUFFER;
+      if (itemY < o.y + o.h + buf && itemBottom > o.y - buf) {
+        hasYOverlap = true;
+        break;
+      }
+    }
+
+    if (!hasYOverlap) break;
+
+    /* 重複していれば再抽選（より地面に近い高さ優先） */
+    floatH = CFG.ITEM_MIN_H + Math.random() * (CFG.ITEM_MAX_H - CFG.ITEM_MIN_H) * 0.5;
+    itemY  = groundY - floatH - CFG.ITEM_SIZE;
+  }
+
+  items.push({
+    x:     spawnX,
+    y:     itemY,
+    w:     CFG.ITEM_SIZE,
+    h:     CFG.ITEM_SIZE,
+    type,
+    emoji: type === 'coin' ? '🪙' : '🌟',
+    phase: Math.random() * Math.PI * 2, // 浮遊アニメーション位相
+  });
+}
+
 function updateItems() {
   /* スポーンタイミング */
   nextItemDist -= speed;
@@ -424,10 +578,18 @@ function checkCollision() {
   if (invincibleFrames > 0) return false; // 無敵中は障害物をすり抜ける
   const p = player.hitbox();
   for (const o of obstacles) {
-    if (
-      p.x < o.x + o.w && p.x + p.w > o.x &&
-      p.y < o.y + o.h && p.y + p.h > o.y
-    ) return true;
+    /*
+     * フライング障害物はヒットボックスを6px内側に縮小して多少フォーギビング（視認難易度補正）
+     * 地面系障害物は従来通りフルサイズ
+     */
+    const margin = o.type === 'flying' ? 6 : 0;
+    const ox = o.x + margin;
+    const oy = o.y + margin;
+    const ow = o.w - margin * 2;
+    const oh = o.h - margin * 2;
+
+    if (p.x < ox + ow && p.x + p.w > ox &&
+        p.y < oy + oh && p.y + p.h > oy) return true;
   }
   return false;
 }
@@ -711,7 +873,7 @@ function drawTitle() {
 
   /* パネル */
   ctx.save();
-  const pw = 420, ph = 280;
+  const pw = 460, ph = 310;
   const px = CFG.W / 2 - pw / 2;
   const py = CFG.H / 2 - ph / 2;
 
@@ -723,25 +885,31 @@ function drawTitle() {
   ctx.textAlign = 'center';
   ctx.font = 'bold 44px Arial';
   ctx.fillStyle = '#ff6b6b';
-  ctx.fillText('🐥 ジャンプ！', CFG.W / 2, py + 68 + bounce);
-
-  ctx.font = '18px Arial';
-  ctx.fillStyle = '#555';
-  ctx.fillText('障害物をジャンプで避けよう！', CFG.W / 2, py + 108);
+  ctx.fillText('🐥 ジャンプ！', CFG.W / 2, py + 62 + bounce);
 
   /* 操作説明 */
   ctx.font = '15px Arial';
   ctx.fillStyle = '#888';
-  ctx.fillText('⌨️  スペース / ↑キー　　📱 画面タップ', CFG.W / 2, py + 142);
+  ctx.fillText('⌨️  スペース / ↑キー　　📱 画面タップ', CFG.W / 2, py + 98);
+
+  /* 障害物の種類ガイド */
+  ctx.font = '14px Arial';
+  ctx.fillStyle = '#666';
+  ctx.textAlign = 'left';
+  const gx = px + 28;
+  ctx.fillText('📦 ノーマル … 軽くジャンプ',      gx, py + 132);
+  ctx.fillText('🧱 トール … 最大ジャンプ！',        gx, py + 155);
+  ctx.fillText('🛸 フライング … ジャンプしないで！', gx, py + 178);
 
   /* スタートボタン（色が脈打つ） */
   const pulse = 0.75 + Math.sin(titleT * 2.5) * 0.25;
-  const btnY  = py + 168;
+  const btnY  = py + 198;
 
   const btnGrd = ctx.createLinearGradient(CFG.W / 2 - 115, btnY, CFG.W / 2 + 115, btnY + 52);
   btnGrd.addColorStop(0, `rgba(255,107,107,${pulse})`);
   btnGrd.addColorStop(1, `rgba(255,154,76,${pulse})`);
   ctx.fillStyle = btnGrd;
+  ctx.textAlign = 'center';
   fillRoundRect(CFG.W / 2 - 115, btnY, 230, 52, 26);
 
   ctx.fillStyle = 'white';
@@ -752,7 +920,7 @@ function drawTitle() {
   if (best > 0) {
     ctx.fillStyle = '#aaa';
     ctx.font = '14px Arial';
-    ctx.fillText(`ベストスコア: ${best} 点`, CFG.W / 2, py + 258);
+    ctx.fillText(`ベストスコア: ${best} 点`, CFG.W / 2, py + 290);
   }
 
   ctx.restore();
@@ -859,6 +1027,7 @@ function startGame() {
   frame      = 0;
   bgOfs      = 0;
   nextObsDist      = CFG.FIRST_OBS;
+  lastObsType      = 'normal';  // ← リセット（最初の障害物はノーマル扱いでギャップ計算）
   obstacles        = [];
   particles        = [];
   scorePopups      = [];
@@ -980,7 +1149,8 @@ function loop() {
     if (checkCollision()) triggerGameOver();
   }
 
-  /* 障害物・アイテム・プレイヤーの描画 */
+  /* 描画順（後ろから前へ）:
+     地面系障害物 → フライング障害物 → アイテム → プレイヤー → パーティクル → HUD */
   drawObstacles();
   drawItems();
   player.draw();
