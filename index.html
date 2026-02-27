@@ -63,6 +63,7 @@ const CFG = {
   JUMP_FORCE: -15,    // ジャンプ初速（マイナスが上方向）
   GRAVITY: 0.65,      // 重力加速度（大きいほど重くなる）
   MAX_FALL: 16,       // 最大落下速度
+  PLAYER_MAX_JUMPS: 2, // ジャンプ可能な総回数（1=シングル、2=ダブルジャンプ）
 
   /* ── 地面 ── */
   GROUND_H: 72,       // 地面の高さ
@@ -72,8 +73,8 @@ const CFG = {
   OBS_MIN_H: 45,      // 障害物の最小高さ
   OBS_MAX_H: 120,     // ノーマル障害物の最大高さ（小ジャンプで越えられる）
   OBS_TALL_H: 155,    // トール障害物の最大高さ（最大ジャンプ高さ181px以内・余裕30px確保）
-  OBS_MIN_GAP_F: 65,  // 障害物の最小出現間隔（フレーム数）── ジャンプ46F＋余裕
-  OBS_MAX_GAP_F: 115, // 障害物の最大出現間隔（フレーム数）
+  OBS_MIN_GAP_F: 80,  // 障害物の最小出現間隔（フレーム数）── ジャンプ46F＋余裕
+  OBS_MAX_GAP_F: 140, // 障害物の最大出現間隔（フレーム数）
   FIRST_OBS: 320,     // 最初の障害物が出るまでの距離
 
   /* ── 障害物（フライング系）── */
@@ -81,7 +82,7 @@ const CFG = {
   FLY_Y_MIN: 90,      // フライング障害物の上端Y最小値（キャンバス上端から）
   FLY_Y_MAX: 200,     // フライング障害物の上端Y最大値（上端200+高さ44=下端244 < 地面プレイヤー判定306）
   /* FLY_Y_MAX+FLY_H=244 < プレイヤー地上ヒットボックス上端306 → 地面走行時は絶対に当たらない */
-  FLY_AFTER_GND_GAP_F: 90, // 地面系→フライング時の最小間隔（着地後の反応時間を十分確保）
+  FLY_AFTER_GND_GAP_F: 110, // 地面系→フライング時の最小間隔（着地後の反応時間を十分確保）
 
   /* ── 速度 ── */
   SPEED_INIT: 4.2,    // 初期スクロール速度
@@ -164,6 +165,7 @@ const player = {
   h: CFG.PLAYER_SIZE,
   vy: 0,
   onGround: true,
+  jumpCount: 0,    // 現在の連続ジャンプ回数（着地でリセット）
 
   /* 地面Y座標 */
   get groundY() {
@@ -174,12 +176,16 @@ const player = {
     this.y = this.groundY;
     this.vy = 0;
     this.onGround = true;
+    this.jumpCount = 0;
   },
 
   jump() {
-    if (!this.onGround) return;
-    this.vy = CFG.JUMP_FORCE;
+    /* jumpCount が上限に達していたらスキップ（isGrounded は条件に使わない）  */
+    /* → 地面では jumpCount===0 なので必ず通過、空中では jumpCount で上限管理  */
+    if (this.jumpCount >= CFG.PLAYER_MAX_JUMPS) return;
+    this.vy = CFG.JUMP_FORCE;   // プロジェクト規約: Y速度は this.vy で管理
     this.onGround = false;
+    this.jumpCount++;
     spawnJumpParticles(this.x + this.w / 2, this.y + this.h);
   },
 
@@ -190,6 +196,7 @@ const player = {
       this.y = this.groundY;
       this.vy = 0;
       this.onGround = true;
+      this.jumpCount = 0; // 着地でリセット（onLand 相当）
     }
   },
 
